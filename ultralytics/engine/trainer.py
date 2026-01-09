@@ -15,6 +15,7 @@ import warnings
 from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+import csv
 
 import numpy as np
 import torch
@@ -432,6 +433,7 @@ class BaseTrainer:
         self.tloss = None
         self.loss_names = ["Loss"]
         self.csv = self.save_dir / "results.csv"
+        self.csv = self.save_dir / "results_kd_loss.csv" 
         self.plot_idx = [0, 1, 2]
 
         # HUB
@@ -526,7 +528,7 @@ class BaseTrainer:
         # Load teacher model to device
         if self.teacher is not None:
             for k, v in self.teacher.named_parameters():
-                v.requires_grad = True
+                v.requires_grad = False # freeze teacher weights we dont want to train the teacher.
             self.teacher = self.teacher.to(self.device)
                 
         self.set_model_attributes()
@@ -699,15 +701,50 @@ class BaseTrainer:
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
                     
+                # # Add more distillation logic
+                # if self.teacher is not None:
+                #     distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                #     with torch.no_grad():
+                #         pred = self.teacher(batch['img'])
+                        
+                #     self.d_loss = distillation_loss.get_loss()
+                #     #self.d_loss *= distill_weight
+                #     self.loss += self.d_loss
                 # Add more distillation logic
                 if self.teacher is not None:
-                    distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                    #distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                    progress = epoch / self.epochs  # progress 0-1 over training
+                    distill_weight = 0.1 + 0.9 * (1 - progress)
+                    # Teacher forward triggers hooks (teacher_outputs). No gradients needed.
                     with torch.no_grad():
                         pred = self.teacher(batch['img'])
-                        
+
+                    # Base loss BEFORE KD is added (for ratio/plots)
+                    base_loss_val = float(self.loss.detach().item())
+
+                    # Raw KD loss (scalar tensor)
                     self.d_loss = distillation_loss.get_loss()
-                    self.d_loss *- distill_weight
+
+                    # Apply weight correctly
+                    self.d_loss *= distill_weight
+
+                    # Add to training loss
                     self.loss += self.d_loss
+
+                    # Total loss AFTER KD
+                    total_loss_val = float(self.loss.detach().item())
+
+                    # Log (use global step 'ni')
+                    self._kd_logger_log(
+                        step=ni,
+                        epoch=epoch,
+                        batch_i=i,
+                        distill_weight=float(distill_weight),
+                        d_loss_raw=float((self.d_loss.detach().item()) / float(distill_weight) if distill_weight != 0 else self.d_loss.detach().item()),
+                        base_loss=base_loss_val,
+                        total_loss=total_loss_val,
+                    )
+
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
@@ -805,6 +842,7 @@ class BaseTrainer:
         if self.teacher is not None:
             distillation_loss.remove_handle_()
         self.run_callbacks("teardown")
+        self._kd_logger_close()
 
     def _get_memory(self):
         """Get accelerator memory utilization in GB."""
@@ -1149,3 +1187,80 @@ class BaseTrainer:
             f'{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)'
         )
         return optimizer
+
+        
+    def _kd_logger_init(self):
+    """Initialize KD loss CSV logger (rank0 only)."""
+    self.kd_log_interval = int(getattr(self.args, "kd_log_interval", 50))  # every N batches
+    self.kd_csv = self.save_dir / "kd_loss.csv"
+    self._kd_fh = None
+    self._kd_writer = None
+
+    if RANK not in {-1, 0}:
+        return  # only log on main process
+
+    try:
+        # Append-safe: if file doesn't exist, write header once
+        file_exists = self.kd_csv.exists()
+        self._kd_fh = open(self.kd_csv, "a", newline="")
+        self._kd_writer = csv.writer(self._kd_fh)
+
+        if not file_exists:
+            self._kd_writer.writerow([
+                "step", "epoch", "batch_i",
+                "distill_weight",
+                "d_loss_raw", "d_loss_eff",
+                "base_loss", "total_loss",
+                "kd_ratio",
+            ])
+            self._kd_fh.flush()
+    except Exception as e:
+        LOGGER.warning(f"WARNING ⚠️ KD CSV logger init failed: {e}")
+        self._kd_fh = None
+        self._kd_writer = None
+
+
+    def _kd_logger_log(self, step, epoch, batch_i, distill_weight, d_loss_raw, base_loss, total_loss):
+        """Log one KD row (rank0 only)."""
+        if RANK not in {-1, 0}:
+            return
+        if self._kd_writer is None:
+            return
+        if self.kd_log_interval > 1 and (batch_i % self.kd_log_interval) != 0:
+            return
+
+        # Effective KD contribution
+        d_loss_eff = d_loss_raw * distill_weight
+
+        # Ratio: "how big is KD compared to base loss"
+        eps = 1e-12
+        kd_ratio = d_loss_eff / (abs(base_loss) + eps)
+
+        try:
+            self._kd_writer.writerow([
+                int(step), int(epoch), int(batch_i),
+                float(distill_weight),
+                float(d_loss_raw), float(d_loss_eff),
+                float(base_loss), float(total_loss),
+                float(kd_ratio),
+            ])
+            # flush occasionally so you don't lose data if runtime dies
+            if (batch_i % (self.kd_log_interval * 10)) == 0:
+                self._kd_fh.flush()
+        except Exception as e:
+            LOGGER.warning(f"WARNING ⚠️ KD CSV logger write failed: {e}")
+
+
+    def _kd_logger_close(self):
+        """Close KD loss CSV logger (rank0 only)."""
+        if RANK not in {-1, 0}:
+            return
+        try:
+            if self._kd_fh is not None:
+                self._kd_fh.flush()
+                self._kd_fh.close()
+        except Exception as e:
+            LOGGER.warning(f"WARNING ⚠️ KD CSV logger close failed: {e}")
+        finally:
+            self._kd_fh = None
+            self._kd_writer = None
