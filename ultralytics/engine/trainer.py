@@ -1190,34 +1190,34 @@ class BaseTrainer:
 
         
     def _kd_logger_init(self):
-    """Initialize KD loss CSV logger (rank0 only)."""
-    self.kd_log_interval = int(getattr(self.args, "kd_log_interval", 50))  # every N batches
-    self.kd_csv = self.save_dir / "kd_loss.csv"
-    self._kd_fh = None
-    self._kd_writer = None
-
-    if RANK not in {-1, 0}:
-        return  # only log on main process
-
-    try:
-        # Append-safe: if file doesn't exist, write header once
-        file_exists = self.kd_csv.exists()
-        self._kd_fh = open(self.kd_csv, "a", newline="")
-        self._kd_writer = csv.writer(self._kd_fh)
-
-        if not file_exists:
-            self._kd_writer.writerow([
-                "step", "epoch", "batch_i",
-                "distill_weight",
-                "d_loss_raw", "d_loss_eff",
-                "base_loss", "total_loss",
-                "kd_ratio",
-            ])
-            self._kd_fh.flush()
-    except Exception as e:
-        LOGGER.warning(f"WARNING ⚠️ KD CSV logger init failed: {e}")
+        """Initialize KD loss CSV logger (rank0 only)."""
+        self.kd_log_interval = int(getattr(self.args, "kd_log_interval", 50))  # every N batches
+        self.kd_csv = self.save_dir / "kd_loss.csv"
         self._kd_fh = None
         self._kd_writer = None
+
+        if RANK not in {-1, 0}:
+            return  # only log on main process
+
+        try:
+            # Append-safe: if file doesn't exist, write header once
+            file_exists = self.kd_csv.exists()
+            self._kd_fh = open(self.kd_csv, "a", newline="")
+            self._kd_writer = csv.writer(self._kd_fh)
+
+            if not file_exists:
+                self._kd_writer.writerow([
+                    "step", "epoch", "batch_i",
+                    "distill_weight",
+                    "d_loss_raw", "d_loss_eff",
+                    "base_loss", "total_loss",
+                    "kd_ratio",
+                ])
+                self._kd_fh.flush()
+        except Exception as e:
+            LOGGER.warning(f"WARNING ⚠️ KD CSV logger init failed: {e}")
+            self._kd_fh = None
+            self._kd_writer = None
 
 
     def _kd_logger_log(self, step, epoch, batch_i, distill_weight, d_loss_raw, base_loss, total_loss):
