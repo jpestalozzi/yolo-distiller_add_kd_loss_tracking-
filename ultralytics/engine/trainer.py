@@ -649,6 +649,7 @@ class BaseTrainer:
         # make loss
         if self.teacher is not None:
             distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+            self._kd_logger_init()  # Initialize KD loss logging
         
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
@@ -1224,7 +1225,7 @@ class BaseTrainer:
         """Log one KD row (rank0 only)."""
         if RANK not in {-1, 0}:
             return
-        if self._kd_writer is None:
+        if not hasattr(self, '_kd_writer') or self._kd_writer is None:
             return
         if self.kd_log_interval > 1 and (batch_i % self.kd_log_interval) != 0:
             return
@@ -1256,7 +1257,7 @@ class BaseTrainer:
         if RANK not in {-1, 0}:
             return
         try:
-            if self._kd_fh is not None:
+            if hasattr(self, '_kd_fh') and self._kd_fh is not None:
                 self._kd_fh.flush()
                 self._kd_fh.close()
         except Exception as e:
